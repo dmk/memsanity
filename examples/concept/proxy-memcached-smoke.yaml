@@ -1,0 +1,41 @@
+suite: proxy-memcached-smoke
+targets:
+  - name: proxy
+    type: memcached
+    address: 127.0.0.1:11211 # your LB/proxy listener
+scenarios:
+  - name: basic-read-write-through-proxy
+    schedule:
+      kind: iterations
+      iterations: 20
+      concurrency: 4
+    steps:
+      - op: set
+        key: lb:smoke
+        value: ok
+        ttl: 10s
+      - op: get
+        key: lb:smoke
+        expect:
+          value: ok
+          latency_ms_lt: 100
+
+  - name: backend-bump-still-reads
+    hooks:
+      before:
+        - exec: ./scripts/bump-backend.sh mc2 # pause/restart one backend (optional)
+          timeout: 5s
+    schedule:
+      kind: duration
+      duration: 10s
+      concurrency: 8
+    steps:
+      - op: set
+        key: lb:shake
+        value: v
+        ttl: 15s
+      - op: get
+        key: lb:shake
+        expect:
+          value: v
+          allowed_fail_ratio_lt: 0.05 # allow brief blips during backend bump

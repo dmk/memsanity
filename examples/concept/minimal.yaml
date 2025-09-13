@@ -1,0 +1,21 @@
+suite: <name>
+targets:
+  - name: a-memcached-server
+    type: memcached
+    address: 127.0.0.1:11211
+scenarios:
+  - name: ya-basic
+    schedule:
+      kind: once # once | duration | iterations
+      duration: 5s
+      concurrency: 4
+    steps:
+      - op: set
+        key: k1
+        value: v1
+        ttl: 5s
+      - op: get
+        key: k1
+        expect:
+          value: v1
+          latency_ms_lt: 50

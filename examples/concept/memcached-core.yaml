@@ -1,0 +1,58 @@
+suite: memcached-core
+targets:
+  - name: mc
+    type: memcached
+    address: 127.0.0.1:11211
+scenarios:
+  - name: set-get-delete
+    schedule:
+      kind: once
+    steps:
+      - op: set
+        key: ms:one
+        value: one
+      - op: get
+        key: ms:one
+        expect:
+          value: one
+      - op: delete
+        key: ms:one
+      - op: get
+        key: ms:one
+        expect:
+          miss: true
+
+  - name: ttl-expiry
+    schedule:
+      kind: once
+    steps:
+      - op: set
+        key: ms:ttl
+        value: short
+        ttl: 1s
+      - op: sleep
+        duration: 1500ms
+      - op: get
+        key: ms:ttl
+        expect:
+          miss: true
+
+  - name: multi-get
+    schedule:
+      kind: iterations
+      iterations: 5
+      concurrency: 2
+    steps:
+      - op: set
+        key: ms:a
+        value: A
+      - op: set
+        key: ms:b
+        value: B
+      - op: mget
+        keys: [ms:a, ms:b, ms:c]
+        expect:
+          values:
+            ms:a: A
+            ms:b: B
+          misses: [ms:c]
