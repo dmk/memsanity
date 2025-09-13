@@ -6,6 +6,7 @@ mod engine;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -43,7 +44,7 @@ async fn main() -> Result<()> {
         Commands::Run { suite, dry_run } => {
             let suite = config::load_suite_from_path(&suite)?;
             if dry_run {
-                println!("Loaded suite: {}", suite.name);
+                info!(suite = %suite.name, "dry_run_loaded");
                 engine::print_plan(&suite);
                 return Ok(());
             }
