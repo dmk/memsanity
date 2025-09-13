@@ -12,7 +12,7 @@ scenarios:
     steps:
       - op: set
         key: k1
-        value: v1
+        value: v2
         ttl: 5s
       - op: get
         key: k1

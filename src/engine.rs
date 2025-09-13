@@ -4,6 +4,7 @@ use crate::config::{
 };
 use crate::core::{ClientFactory, KvClient, ProtocolKind, TargetSpec};
 use crate::drivers::noop::NoopClientFactory;
+use crate::drivers::memcached::MemcachedClientFactory;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,24 +47,30 @@ static OP_ID: AtomicU64 = AtomicU64::new(1);
 fn next_op_id() -> u64 { OP_ID.fetch_add(1, Ordering::Relaxed) }
 
 pub async fn execute_suite(suite: &SuiteConfig) -> Result<()> {
-    // For now use a noop factory. Later: build real memcached/redis drivers.
-    let factory = NoopClientFactory;
-
     let mut clients: HashMap<String, Arc<dyn KvClient>> = HashMap::new();
     for target in &suite.targets {
         let protocol = match target.kind {
             TargetKind::Memcached => ProtocolKind::Memcached,
             TargetKind::Redis => ProtocolKind::Redis,
         };
-        let client = factory
-            .build(
-                protocol,
-                TargetSpec {
-                    name: target.name.clone(),
-                    address: target.address.clone(),
-                },
-            )
-            .await?;
+        let client: Arc<dyn KvClient> = match protocol {
+            ProtocolKind::Memcached => {
+                MemcachedClientFactory
+                    .build(
+                        protocol,
+                        TargetSpec { name: target.name.clone(), address: target.address.clone() },
+                    )
+                    .await?
+            }
+            _ => {
+                NoopClientFactory
+                    .build(
+                        protocol,
+                        TargetSpec { name: target.name.clone(), address: target.address.clone() },
+                    )
+                    .await?
+            }
+        };
         clients.insert(target.name.clone(), client);
     }
 
@@ -155,22 +162,92 @@ async fn execute_steps(scenario: String, worker_id: usize, steps: Vec<StepConfig
             }
             StepConfig::Get { key, expect } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", key = %key);
-                let _ = client
+                let start = tokio::time::Instant::now();
+                let got = client
                     .get(op_id, key)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
                 if let Some(e) = expect {
                     print_expect(op_id, e);
+                    if let Some(expected_value) = &e.value {
+                        match &got {
+                            Some(actual) if actual == expected_value => {}
+                            other => {
+                                let got_str = other.as_ref().map(|s| s.as_str()).unwrap_or("");
+                                return Err(anyhow::anyhow!(format!(
+                                    "get value mismatch: expected='{}' got='{}'",
+                                    expected_value, got_str
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(expect_miss) = e.miss {
+                        if expect_miss && got.is_some() {
+                            return Err(anyhow::anyhow!("expected miss but got value"));
+                        }
+                        if !expect_miss && got.is_none() {
+                            return Err(anyhow::anyhow!("expected hit but got miss"));
+                        }
+                    }
+                    if let Some(limit_ms) = e.latency_ms_lt {
+                        if elapsed_ms >= limit_ms {
+                            return Err(anyhow::anyhow!(format!(
+                                "latency too high: {}ms >= {}ms",
+                                elapsed_ms, limit_ms
+                            )));
+                        }
+                    }
                 }
             }
             StepConfig::Mget { keys, expect } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", keys = ?keys);
-                let _ = client
+                let start = tokio::time::Instant::now();
+                let got = client
                     .mget(op_id, keys)
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let _elapsed_ms = start.elapsed().as_millis() as u64;
                 if let Some(e) = expect {
                     print_expect_multi(op_id, e);
+                    if let Some(expected_values) = &e.values {
+                        for (k, expected_v) in expected_values {
+                            // Find index in keys
+                            if let Some(pos) = keys.iter().position(|kk| kk == k) {
+                                match &got.get(pos) {
+                                    Some(Some(actual_v)) if actual_v == expected_v => {}
+                                    other => {
+                                        return Err(anyhow::anyhow!(format!(
+                                            "mget value mismatch for key '{}': expected='{}' got={:?}",
+                                            k, expected_v, other
+                                        )));
+                                    }
+                                }
+                            } else {
+                                return Err(anyhow::anyhow!(format!(
+                                    "mget expected key '{}' not in requested keys",
+                                    k
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(misses) = &e.misses {
+                        for miss_key in misses {
+                            if let Some(pos) = keys.iter().position(|kk| kk == miss_key) {
+                                if got.get(pos).and_then(|v| v.clone()).is_some() {
+                                    return Err(anyhow::anyhow!(format!(
+                                        "mget expected miss for '{}' but got value",
+                                        miss_key
+                                    )));
+                                }
+                            } else {
+                                return Err(anyhow::anyhow!(format!(
+                                    "mget expected miss key '{}' not in requested keys",
+                                    miss_key
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             StepConfig::Delete { key } => {
