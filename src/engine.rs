@@ -43,6 +43,23 @@ fn step_label(step: &StepConfig) -> &'static str {
     }
 }
 
+#[derive(Default)]
+struct RunSummary {
+    total_steps: AtomicU64,
+    failed_steps: AtomicU64,
+}
+
+impl RunSummary {
+    fn incr_total(&self) { self.total_steps.fetch_add(1, Ordering::Relaxed); }
+    fn incr_failed(&self) { self.failed_steps.fetch_add(1, Ordering::Relaxed); }
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.total_steps.load(Ordering::Relaxed),
+            self.failed_steps.load(Ordering::Relaxed),
+        )
+    }
+}
+
 static OP_ID: AtomicU64 = AtomicU64::new(1);
 fn next_op_id() -> u64 { OP_ID.fetch_add(1, Ordering::Relaxed) }
 
@@ -77,17 +94,22 @@ pub async fn execute_suite(suite: &SuiteConfig) -> Result<()> {
     // Naively pick the first client (if any) for now
     let default_client = clients.values().next().cloned();
 
+    let summary = Arc::new(RunSummary::default());
+
     for sc in &suite.scenarios {
         if let Some(client) = default_client.clone() {
-            run_scenario(sc, client.clone()).await?;
+            run_scenario(sc, client.clone(), summary.clone()).await?;
         } else {
             info!(scenario = %sc.name, "scenario_skipped_no_targets");
         }
     }
+
+    let (total, failed) = summary.snapshot();
+    info!(total, failed, status = %if failed == 0 {"ok"} else {"fail"}, "summary");
     Ok(())
 }
 
-async fn run_scenario(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<()> {
+async fn run_scenario(sc: &ScenarioConfig, client: Arc<dyn KvClient>, summary: Arc<RunSummary>) -> Result<()> {
     // Read hooks to avoid dead-code warnings and to sketch behavior
     if let Some(hooks) = &sc.hooks {
         for h in &hooks.before {
@@ -95,14 +117,14 @@ async fn run_scenario(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<
         }
     }
     match sc.schedule.kind {
-        ScheduleKind::Once => run_once(sc, client.clone()).await,
-        ScheduleKind::Iterations => run_iterations(sc, client.clone()).await,
-        ScheduleKind::Duration => run_for_duration(sc, client.clone()).await,
+        ScheduleKind::Once => run_once(sc, client.clone(), summary.clone()).await,
+        ScheduleKind::Iterations => run_iterations(sc, client.clone(), summary.clone()).await,
+        ScheduleKind::Duration => run_for_duration(sc, client.clone(), summary.clone()).await,
     }
 }
 
-async fn run_once(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<()> {
-    execute_steps(sc.name.clone(), 0, sc.steps.clone(), client.clone()).await?;
+async fn run_once(sc: &ScenarioConfig, client: Arc<dyn KvClient>, summary: Arc<RunSummary>) -> Result<()> {
+    execute_steps(sc.name.clone(), 0, sc.steps.clone(), client.clone(), summary.clone()).await?;
     if let Some(hooks) = &sc.hooks {
         for h in &hooks.after {
             info!(hook = %h.exec, timeout = ?h.timeout, when = "after", "hook");
@@ -111,7 +133,7 @@ async fn run_once(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<()> 
     Ok(())
 }
 
-async fn run_iterations(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<()> {
+async fn run_iterations(sc: &ScenarioConfig, client: Arc<dyn KvClient>, summary: Arc<RunSummary>) -> Result<()> {
     let n = sc.schedule.iterations.unwrap_or(1);
     let conc = sc.schedule.concurrency.max(1) as usize;
     let mut handles = Vec::with_capacity(conc);
@@ -119,9 +141,10 @@ async fn run_iterations(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Resul
         let steps = sc.steps.clone();
         let client = client.clone();
         let scenario_name = sc.name.clone();
+        let summary = summary.clone();
         handles.push(tokio::spawn(async move {
             for _ in 0..n {
-                let _ = execute_steps(scenario_name.clone(), worker_id, steps.clone(), client.clone()).await;
+                let _ = execute_steps(scenario_name.clone(), worker_id, steps.clone(), client.clone(), summary.clone()).await;
             }
         }));
     }
@@ -129,7 +152,7 @@ async fn run_iterations(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Resul
     Ok(())
 }
 
-async fn run_for_duration(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Result<()> {
+async fn run_for_duration(sc: &ScenarioConfig, client: Arc<dyn KvClient>, summary: Arc<RunSummary>) -> Result<()> {
     let conc = sc.schedule.concurrency.max(1) as usize;
     let duration = sc.schedule.duration.as_deref().and_then(parse_duration).unwrap_or(Duration::from_secs(1));
     let mut handles = Vec::with_capacity(conc);
@@ -137,10 +160,11 @@ async fn run_for_duration(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Res
         let steps = sc.steps.clone();
         let client = client.clone();
         let scenario_name = sc.name.clone();
+        let summary = summary.clone();
         handles.push(tokio::spawn(async move {
             let start = tokio::time::Instant::now();
             while start.elapsed() < duration {
-                let _ = execute_steps(scenario_name.clone(), worker_id, steps.clone(), client.clone()).await;
+                let _ = execute_steps(scenario_name.clone(), worker_id, steps.clone(), client.clone(), summary.clone()).await;
             }
         }));
     }
@@ -148,120 +172,157 @@ async fn run_for_duration(sc: &ScenarioConfig, client: Arc<dyn KvClient>) -> Res
     Ok(())
 }
 
-async fn execute_steps(scenario: String, worker_id: usize, steps: Vec<StepConfig>, client: Arc<dyn KvClient>) -> Result<()> {
+async fn execute_steps(scenario: String, worker_id: usize, steps: Vec<StepConfig>, client: Arc<dyn KvClient>, summary: Arc<RunSummary>) -> Result<()> {
     for (idx, step) in steps.iter().enumerate() {
         let op_id = next_op_id();
+        summary.incr_total();
         match step {
             StepConfig::Set { key, value, ttl } => {
                 let _ttl = ttl.as_deref().and_then(parse_duration);
-                info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "set", key = %key, value = %value, ?_ttl);
-                client
+                info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "set", key = %key, value = %value);
+                match client
                     .set(op_id, key, value, _ttl)
                     .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                {
+                    Ok(_) => {
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "set", result = "ok");
+                    }
+                    Err(e) => {
+                        summary.incr_failed();
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "set", result = "fail", error = %e);
+                    }
+                }
             }
             StepConfig::Get { key, expect } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", key = %key);
                 let start = tokio::time::Instant::now();
-                let got = client
+                match client
                     .get(op_id, key)
                     .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let elapsed_ms = start.elapsed().as_millis() as u64;
-                if let Some(e) = expect {
-                    print_expect(op_id, e);
-                    if let Some(expected_value) = &e.value {
-                        match &got {
-                            Some(actual) if actual == expected_value => {}
-                            other => {
-                                let got_str = other.as_ref().map(|s| s.as_str()).unwrap_or("");
-                                return Err(anyhow::anyhow!(format!(
-                                    "get value mismatch: expected='{}' got='{}'",
-                                    expected_value, got_str
-                                )));
+                {
+                    Ok(got) => {
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let hit = got.is_some();
+                        let value = got.as_deref().unwrap_or("");
+                        let mut ok = true;
+                        if let Some(e) = expect {
+                            print_expect(op_id, e);
+                            if let Some(expected_value) = &e.value {
+                                if hit && value == expected_value {
+                                    // ok
+                                } else {
+                                    ok = false;
+                                    summary.incr_failed();
+                                    info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "fail", reason = "value_mismatch", expected = %expected_value, got = %value, hit);
+                                }
+                            }
+                            if let Some(expect_miss) = e.miss {
+                                if expect_miss && hit {
+                                    ok = false;
+                                    summary.incr_failed();
+                                    info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "fail", reason = "expected_miss_got_hit", got = %value);
+                                }
+                                if !expect_miss && !hit {
+                                    ok = false;
+                                    summary.incr_failed();
+                                    info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "fail", reason = "expected_hit_got_miss");
+                                }
+                            }
+                            if let Some(limit_ms) = e.latency_ms_lt {
+                                if elapsed_ms >= limit_ms {
+                                    ok = false;
+                                    summary.incr_failed();
+                                    info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "fail", reason = "latency_too_high", elapsed_ms, limit_ms);
+                                }
                             }
                         }
-                    }
-                    if let Some(expect_miss) = e.miss {
-                        if expect_miss && got.is_some() {
-                            return Err(anyhow::anyhow!("expected miss but got value"));
-                        }
-                        if !expect_miss && got.is_none() {
-                            return Err(anyhow::anyhow!("expected hit but got miss"));
+                        if ok {
+                            info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "ok", hit, value = %value, elapsed_ms);
                         }
                     }
-                    if let Some(limit_ms) = e.latency_ms_lt {
-                        if elapsed_ms >= limit_ms {
-                            return Err(anyhow::anyhow!(format!(
-                                "latency too high: {}ms >= {}ms",
-                                elapsed_ms, limit_ms
-                            )));
-                        }
+                    Err(e) => {
+                        summary.incr_failed();
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "get", result = "fail", error = %e);
                     }
                 }
             }
             StepConfig::Mget { keys, expect } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", keys = ?keys);
                 let start = tokio::time::Instant::now();
-                let got = client
+                match client
                     .mget(op_id, keys)
                     .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                let _elapsed_ms = start.elapsed().as_millis() as u64;
-                if let Some(e) = expect {
-                    print_expect_multi(op_id, e);
-                    if let Some(expected_values) = &e.values {
-                        for (k, expected_v) in expected_values {
-                            // Find index in keys
-                            if let Some(pos) = keys.iter().position(|kk| kk == k) {
-                                match &got.get(pos) {
-                                    Some(Some(actual_v)) if actual_v == expected_v => {}
-                                    other => {
-                                        return Err(anyhow::anyhow!(format!(
-                                            "mget value mismatch for key '{}': expected='{}' got={:?}",
-                                            k, expected_v, other
-                                        )));
+                {
+                    Ok(got) => {
+                        let _elapsed_ms = start.elapsed().as_millis() as u64;
+                        let mut ok = true;
+                        if let Some(e) = expect {
+                            print_expect_multi(op_id, e);
+                            if let Some(expected_values) = &e.values {
+                                for (k, expected_v) in expected_values {
+                                    if let Some(pos) = keys.iter().position(|kk| kk == k) {
+                                        match &got.get(pos) {
+                                            Some(Some(actual_v)) if actual_v == expected_v => {}
+                                            _ => {
+                                                ok = false;
+                                                summary.incr_failed();
+                                                info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "fail", reason = "value_mismatch", key = %k, expected = %expected_v);
+                                            }
+                                        }
+                                    } else {
+                                        ok = false;
+                                        summary.incr_failed();
+                                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "fail", reason = "expected_key_not_requested", key = %k);
                                     }
                                 }
-                            } else {
-                                return Err(anyhow::anyhow!(format!(
-                                    "mget expected key '{}' not in requested keys",
-                                    k
-                                )));
                             }
+                            if let Some(misses) = &e.misses {
+                                for miss_key in misses {
+                                    if let Some(pos) = keys.iter().position(|kk| kk == miss_key) {
+                                        if got.get(pos).and_then(|v| v.clone()).is_some() {
+                                            ok = false;
+                                            summary.incr_failed();
+                                            info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "fail", reason = "expected_miss_got_value", key = %miss_key);
+                                        }
+                                    } else {
+                                        ok = false;
+                                        summary.incr_failed();
+                                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "fail", reason = "miss_key_not_in_requested", key = %miss_key);
+                                    }
+                                }
+                            }
+                        }
+                        if ok {
+                            info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "ok");
                         }
                     }
-                    if let Some(misses) = &e.misses {
-                        for miss_key in misses {
-                            if let Some(pos) = keys.iter().position(|kk| kk == miss_key) {
-                                if got.get(pos).and_then(|v| v.clone()).is_some() {
-                                    return Err(anyhow::anyhow!(format!(
-                                        "mget expected miss for '{}' but got value",
-                                        miss_key
-                                    )));
-                                }
-                            } else {
-                                return Err(anyhow::anyhow!(format!(
-                                    "mget expected miss key '{}' not in requested keys",
-                                    miss_key
-                                )));
-                            }
-                        }
+                    Err(e) => {
+                        summary.incr_failed();
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "mget", result = "fail", error = %e);
                     }
                 }
             }
             StepConfig::Delete { key } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "delete", key = %key);
-                client
+                match client
                     .delete(op_id, key)
                     .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                {
+                    Ok(_) => {
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "delete", result = "ok");
+                    }
+                    Err(e) => {
+                        summary.incr_failed();
+                        info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "delete", result = "fail", error = %e);
+                    }
+                }
             }
             StepConfig::Sleep { duration } => {
                 info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "sleep", duration = %duration);
                 if let Some(dur) = parse_duration(duration) {
                     sleep(dur).await;
                 }
+                info!(op_id, scenario = %scenario, worker_id, step_idx = idx, op = "sleep", result = "ok");
             }
         }
     }
