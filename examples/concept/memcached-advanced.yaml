@@ -1,0 +1,105 @@
+suite: memcached-advanced
+targets:
+  - name: mc
+    type: memcached
+    address: 127.0.0.1:11211
+
+scenarios:
+  - name: ttl-behavior
+    schedule:
+      kind: iterations
+      iterations: 2
+      concurrency: 2
+    hooks:
+      before:
+        - exec: "echo starting ttl-behavior"
+          timeout: 1s
+      after:
+        - exec: "echo finished ttl-behavior"
+          timeout: 1s
+    steps:
+      - op: set
+        key: ms:ttl
+        value: v
+        ttl: 1s
+      - op: sleep
+        duration: 500ms
+      - op: get
+        key: ms:ttl
+        expect:
+          value: v
+          latency_ms_lt: 50
+      - op: sleep
+        duration: 700ms
+      - op: get
+        key: ms:ttl
+        expect:
+          miss: true
+
+  - name: overwrite
+    schedule:
+      kind: once
+    steps:
+      - op: set
+        key: ms:ovr
+        value: v1
+      - op: set
+        key: ms:ovr
+        value: v2
+      - op: get
+        key: ms:ovr
+        expect:
+          value: v2
+
+  - name: mget-mixed
+    schedule:
+      kind: iterations
+      iterations: 3
+      concurrency: 3
+    steps:
+      - op: set
+        key: ms:a
+        value: A
+      - op: set
+        key: ms:b
+        value: B
+      - op: mget
+        keys: [ms:a, ms:b, ms:c]
+        expect:
+          values:
+            ms:a: A
+            ms:b: B
+          misses: [ms:c]
+      - op: delete
+        key: ms:a
+      - op: mget
+        keys: [ms:a, ms:b, ms:c]
+        expect:
+          values:
+            ms:b: B
+          misses: [ms:a, ms:c]
+
+  - name: load-for-duration
+    schedule:
+      kind: duration
+      duration: 3s
+      concurrency: 4
+    steps:
+      - op: set
+        key: ms:ld:a
+        value: A
+      - op: set
+        key: ms:ld:b
+        value: B
+      - op: get
+        key: ms:ld:a
+        expect:
+          value: A
+      - op: delete
+        key: ms:ld:b
+      - op: get
+        key: ms:ld:b
+        expect:
+          miss: true
+
+

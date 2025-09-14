@@ -12,10 +12,10 @@ scenarios:
     steps:
       - op: set
         key: k1
-        value: v2
+        value: v1
         ttl: 5s
       - op: get
         key: k1
         expect:
           value: v1
-          latency_ms_lt: 50
+          latency_ms_lt: 1
